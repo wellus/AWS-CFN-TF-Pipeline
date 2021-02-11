@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Serverless deployment seed pipeline for Terraform projects
+Parameters:
+  RepoName:
+    Type: String
+    Default: tf-seed-pipeline
+    Description: The Git CodeCommit repository where the Terraform files (to be executed) are located
+  RepoBranch:
+    Type: String
+    Default: master
+    Description: The Git CodeCommit branch to be used
+  TerraformVersion:
+    Type: String
+    Default: 0.13.0
+    Description: The Terraform version to use
+  TerraformBucketName:
+    Type: String
+    Default:  pct-terraform-state-bucket-pop
+    Description: The Terraform S3 BucketName
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Source Code Repository
+        Parameters:
+          - RepoName
+          - RepoBranch
+      - Label:
+          default: Terraform
+        Parameters:
+          - TerraformVersion
+      - Label:
+          default: Pipeline-Infra
+        Parameters:
+          - TerraformBucketName
+Resources:
+  TFMasterSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+      - Endpoint: "nicholas.barton-wells@digital.homeoffice.gov.uk"
+        Protocol: email
+  TFMasterRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: tf-seed-pipeline
+      RepositoryDescription: A pipeline for pipleines
+      Triggers:
+      - Name: MasterTrigger
+        CustomData: PCT
+        DestinationArn:
+          Ref: TFMasterSNSTopic
+        Branches:
+        - Master
+        Events:
+        - all
+  TerraformStateDynamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      BillingMode: PAY_PER_REQUEST
+      TableName: terraform-up-and-running-locks
+      AttributeDefinitions: 
+        - 
+          AttributeName: "LockID"
+          AttributeType: "S"
+      KeySchema: 
+        - 
+          AttributeName: "LockID"
+          KeyType: "HASH"
+  TerraformStateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref TerraformBucketName
+      VersioningConfiguration:
+        Status: Enabled
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      AccessControl: BucketOwnerFullControl
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Location: !Ref ArtifactStoreBucket
+        Type: S3
+      Stages:
+        - Name: Source
+          Actions:
+            - InputArtifacts: []
+              Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                RepositoryName: !Ref RepoName
+                BranchName: !Ref RepoBranch
+              RunOrder: 1
+        - Name: InvokeTerraformPlan
+          Actions:
+          - Name: InvokeTerraformActionPlan
+            ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+            OutputArtifacts:
+              - Name: InvokeTerraformOutputPlan
+            InputArtifacts:
+              - Name: SourceOutput
+            Configuration:
+                ProjectName: !Ref InvokeTerraformPlan
+            RunOrder: 1
+        - Name: InvokeTerraformApproval
+          Actions:
+          - Name: InvokeTerraformActionApprove
+            ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Version: 1
+                Provider: Manual
+            Configuration:
+                CustomData: "Please Review"
+            RunOrder: 2
+        - Name: InvokeTerraform
+          Actions:
+          - Name: InvokeTerraformActionApply
+            ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+            OutputArtifacts:
+              - Name: InvokeTerraformOutputApply
+            InputArtifacts:
+              - Name: SourceOutput
+            Configuration:
+                ProjectName: !Ref InvokeTerraformApply
+            RunOrder: 3
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codepipeline.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  InvokeTerraformPlan:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/eb-go-1.5-amazonlinux-64:2.1.3
+        Type: LINUX_CONTAINER
+      Name: !Sub ${AWS::StackName}-InvokeTerraformPlan
+      ServiceRole: !Ref InvokeTerraformBuildRole
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.1
+          phases:
+            install:
+              commands:
+                - yum -y install jq
+                - cd /tmp && curl -o terraform.zip https://releases.hashicorp.com/terraform/${TerraformVersion}/terraform_${TerraformVersion}_linux_amd64.zip && unzip terraform.zip && mv terraform /usr/bin
+            build:
+              commands:
+                - terraform init
+                - terraform plan
+
+  InvokeTerraformApply:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/eb-go-1.5-amazonlinux-64:2.1.3
+        Type: LINUX_CONTAINER
+      Name: !Sub ${AWS::StackName}-InvokeTerraformApply
+      ServiceRole: !Ref InvokeTerraformBuildRole
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.1
+          phases:
+            install:
+              commands:
+                - yum -y install jq
+                - cd /tmp && curl -o terraform.zip https://releases.hashicorp.com/terraform/${TerraformVersion}/terraform_${TerraformVersion}_linux_amd64.zip && unzip terraform.zip && mv terraform /usr/bin
+            build:
+              commands:
+                - terraform init
+                - terraform apply -auto-approve
+
+  InvokeTerraformBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
